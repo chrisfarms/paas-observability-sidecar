@@ -1,0 +1,8 @@
+---
+processes:
+- type: telegraf
+  command: >
+    ${TELEGRAF_ROOT}/bin/telegraf
+    --config "${TELEGRAF_ROOT}/conf/telegraf.conf"
+  platforms: {cloudfoundry: {sidecar_for: [web]}}
+

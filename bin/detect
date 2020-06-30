@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# bin/detect <build-dir>
+set -e
+
+BUILD_DIR=$(cd "$1/" && pwd)
+
+# always add sidecar
+echo "-----> using observability sidecar"
+exit 0
+

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# https://docs.cloudfoundry.org/buildpacks/understand-buildpacks.html
+
+BUILD_DIR="${1}"
+CACHE_DIR="${2}"
+DEPS_DIR="${3}"
+DEPS_IDX="${4}"
+
+BUILDPACK_DIR=$(dirname $(readlink -f ${BASH_SOURCE%/*}))
+source ${BUILDPACK_DIR}/versions.sh
+
+echo "-----> fetching sidecar deps"
+TELEGRAF_CHECKSUM_PATH="${CACHE_DIR}/telegraf-${TELEGRAF_VERSION}.linux-amd64.sum"
+TELEGRAF_TAR_PATH="${CACHE_DIR}/telegraf-${TELEGRAF_VERSION}.linux-amd64.tar.gz"
+TELEGRAF_DIR="${DEPS_DIR}/${DEPS_IDX}/telegraf"
+# echo "${TELEGRAF_SHA256} ${TELEGRAF_TAR_PATH}" > "$TELEGRAF_CHECKSUM_PATH"
+# if ! sha256sum -c "$TELEGRAF_CHECKSUM_PATH" 2>/dev/null 1>/dev/null; then
+# 	echo "-----> downloading telegraf: ${TELEGRAF_DOWNLOAD_URL}"
+# 	if curl -fLs -o "$TELEGRAF_TAR_PATH" "$TELEGRAF_DOWNLOAD_URL"; then
+# 		sha256sum ${TELEGRAF_TAR_PATH}
+# 		sha256sum -c "$TELEGRAF_CHECKSUM_PATH"
+# 	else
+# 		echo "ERROR: telegraf version ${TELEGRAF_VERSION} not found, URL=${TELEGRAF_DOWNLOAD_URL}"
+# 		exit 1
+# 	fi
+# fi
+
+echo "-----> installing telegraf"
+mkdir -p "${TELEGRAF_DIR}/bin"
+mkdir -p "${TELEGRAF_DIR}/conf"
+# tar -zxf "${TELEGRAF_TAR_PATH}" -C "${TELEGRAF_DIR}/bin" --strip-components 2
+cp "${BUILDPACK_DIR}/telegraf" "${TELEGRAF_DIR}/bin/"
+mkdir -p "${BUILD_DIR}/.profile.d"
+
+echo "-----> writing sidecar environment"
+cat <<EOF > "${BUILD_DIR}/.profile.d/0010_telegraf.sh"
+export TELEGRAF_ROOT="/home/vcap/deps/${DEPS_IDX}/telegraf"
+export PATH="\${TELEGRAF_ROOT}/bin:\$PATH"
+export TELEGRAF_OUTPUT_INFLUXDB_URI="\$(echo \$VCAP_SERVICES | jq -r '.influxdb[0].credentials.uri')"
+export TELEGRAF_OUTPUT_INFLUXDB_HOSTNAME="\$(echo \$VCAP_SERVICES | jq -r '.influxdb[0].credentials.hostname')"
+export TELEGRAF_OUTPUT_INFLUXDB_PORT="\$(echo \$VCAP_SERVICES | jq -r '.influxdb[0].credentials.port')"
+export TELEGRAF_OUTPUT_INFLUXDB_USERNAME="\$(echo \$VCAP_SERVICES | jq -r '.influxdb[0].credentials.username')"
+export TELEGRAF_OUTPUT_INFLUXDB_PASSWORD="\$(echo \$VCAP_SERVICES | jq -r '.influxdb[0].credentials.password')"
+export TELEGRAF_TAG_ORG="\$(echo \$VCAP_APPLICATION | jq -r '.organization_name')"
+export TELEGRAF_TAG_SPACE="\$(echo \$VCAP_APPLICATION | jq -r '.space_name')"
+export TELEGRAF_TAG_APP="\$(echo \$VCAP_APPLICATION | jq -r '.application_name')"
+export TELEGRAF_TAG_INSTANCE="\${CF_INSTANCE_INDEX}"
+export TELEGRAF_HOSTNAME="\${TELEGRAF_TAG_ORG}.\${TELEGRAF_TAG_SPACE}.\${TELEGRAF_TAG_APP}.\${TELEGRAF_TAG_INSTANCE}"
+export TELEGRAF_INPUT_POSTGRES_ADDRESS="\$(echo \$VCAP_SERVICES | jq -e -r .postgres[0].credentials.uri)"
+export CF_SHARD_ID="\${TELEGRAF_OUTPUT_INFLUXDB_HOSTNAME}"
+export CF_SOURCE_ID="\$(echo \$VCAP_APPLICATION | jq -r '.application_id')"
+export CF_API_ADDRESS="\$(echo \$VCAP_APPLICATION | jq -r '.cf_api')"
+export CF_RLP_ADDRESS="\$(curl \$CF_API_ADDRESS | jq -r .links.log_stream.href)"
+EOF
+
+echo "-----> writing sidecar configuration"
+chmod +x "${TELEGRAF_DIR}/bin/telegraf"
+cp "${BUILDPACK_DIR}/telegraf.conf" "${TELEGRAF_DIR}/conf/"
+
+
+echo "-----> detecting metric collection methods"
+
+echo "       ✓ cpu"
+echo "       ✓ disk"
+echo "       ✓ diskio"
+echo "       ✓ kernel"
+echo "       ✓ memory"
+echo "       ✓ network"
+echo "       ✓ processes"
+echo "       ✓ swap"
+echo "       ✓ system"
+
+if echo ${VCAP_SERVICES:-"{}"} | jq -e .postgres >/dev/null; then
+echo "       ✓ postgres"
+cat <<EOF >> "${TELEGRAF_DIR}/conf/telegraf.conf"
+[[inputs.postgresql]]
+  address = "\${TELEGRAF_INPUT_POSTGRES_ADDRESS}"
+  ignored_databases = ["template0", "template1"]
+EOF
+else
+echo "       ✘ postgres [bind a postgres service to collect db stats]"
+fi
+
+if [[ -z "${PROMETHEUS_METRICS_URL:-}" ]]; then
+echo "       ✘ prometheus [set PROMETHEUS_METRICS_URL to enable]"
+else
+echo "       ✓ prometheus ${PROMETHEUS_METRICS_URL}"
+cat <<EOF >> "${TELEGRAF_DIR}/conf/telegraf.conf"
+[[inputs.prometheus]]
+  urls = ["${PROMETHEUS_METRICS_URL}"]
+  metric_version = 2
+EOF
+fi
+
+if [[ -z "${CF_USERNAME:-}" ]] && [[ -z "${CF_CLIENT_ID:-}" ]]; then
+echo "       ✘ cloudfoundry [set CF_* variables to enable]"
+else
+echo "       ✓ cloudfoundry"
+cat <<EOF >> "${TELEGRAF_DIR}/conf/telegraf.conf"
+[[inputs.cloudfoundry]]
+  gateway_address = "\${CF_RLP_ADDRESS}"
+  api_address = "\${CF_API_ADDRESS}"
+  shard_id = "\${CF_SHARD_ID}"
+  source_id = "\${CF_SOURCE_ID}"
+  retry_interval = "5s"
+EOF
+if [[ -z "${CF_CLIENT_ID:-}" ]]; then
+cat <<EOF >> "${TELEGRAF_DIR}/conf/telegraf.conf"
+  username = "\${CF_USERNAME}"
+  password = "\${CF_PASSWORD}"
+EOF
+else
+cat <<EOF >> "${TELEGRAF_DIR}/conf/telegraf.conf"
+  client_id = "\${CF_CLIENT_ID}"
+  client_secret = "\${CF_CLIENT_SECRET}"
+EOF
+fi
+fi
+
+cp "${BUILDPACK_DIR}/launch.yml" "${DEPS_DIR}/${DEPS_IDX}/launch.yml"
